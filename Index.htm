@@ -3,65 +3,326 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Minesweeper Pro Arena v1.2.6</title>
+    <title>Minesweeper Pro Arena</title>
+    <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap');
-        body { font-family: 'Inter', sans-serif; -webkit-tap-highlight-color: transparent; }
-        .scrollbar-hide::-webkit-scrollbar { display: none; }
-        .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
-        canvas { image-rendering: pixelated; }
-    </style>
-</head>
-<body class="bg-black text-white selection:bg-blue-500/30">
-    <div id="root"></div>
-
-    <!-- React and Dependencies -->
+    <!-- React & Babel for Browser JSX -->
     <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+        body { background-color: black; color: white; margin: 0; overflow-x: hidden; }
+        .scrollbar-hide::-webkit-scrollbar { display: none; }
+        .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
+        canvas { image-rendering: pixelated; touch-action: none; }
+        input[type="range"] { -webkit-appearance: none; appearance: none; background: transparent; cursor: pointer; }
+        input[type="range"]::-webkit-slider-runnable-track { background: #1f2937; height: 0.25rem; border-radius: 0.5rem; }
+        input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; margin-top: -6px; background-color: #2563eb; height: 1rem; width: 1rem; border-radius: 50%; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
 
     <script type="text/babel">
         const { useState, useEffect, useRef } = React;
 
+        // --- Firebase Mock/Config Injection ---
+        // Note: In the local standalone version, we fallback to local storage if config is missing
+        const firebaseConfig = window.__firebase_config ? JSON.parse(window.__firebase_config) : { apiKey: "mock" };
+        const appId = window.__app_id || 'minesweeper-pro-arena-standalone';
+        const STORAGE_KEY = `ms_pro_arena_state_${appId}`;
+
         function App() {
-            const [activeTab, setActiveTab] = useState('game');
+            const [activeTab, setActiveTab] = useState('game'); 
             const [difficulty, setDifficulty] = useState({ label: 'Amateur', rows: 15, cols: 15, mines: 35, xp: 100 });
-            const [zoom, setZoom] = useState(32);
-            const [primaryMode, setPrimaryMode] = useState('reveal');
-            const [gameState, setGameState] = useState('playing');
+            const [zoom, setZoom] = useState(32); 
+            const [primaryMode, setPrimaryMode] = useState('reveal'); 
+            const [gameState, setGameState] = useState('playing'); 
             const [timer, setTimer] = useState(0);
             const [flags, setFlags] = useState(0);
             const [grid, setGrid] = useState([]);
+            const [userProfile, setUserProfile] = useState({ name: 'Operative', xp: 0, wins: 0, level: 1 });
+            const [newName, setNewName] = useState('');
             const [showResetDialog, setShowResetDialog] = useState(false);
 
             const canvasRef = useRef(null);
             const timerIntervalRef = useRef(null);
             const firstClickRef = useRef(true);
+            
+            const longPressTimer = useRef(null);
+            const initialPinchDist = useRef(null);
+            const initialZoom = useRef(null);
+            const isPinching = useRef(false);
 
-            const initGrid = (rows, cols) => Array.from({ length: rows }, () => Array.from({ length: cols }, () => ({ 
+            // --- PERSISTENCE: LOAD STATE ---
+            useEffect(() => {
+                const saved = localStorage.getItem(STORAGE_KEY);
+                if (saved) {
+                    try {
+                        const parsed = JSON.parse(saved);
+                        setGrid(parsed.grid);
+                        setDifficulty(parsed.difficulty);
+                        setTimer(parsed.timer);
+                        setFlags(parsed.flags);
+                        setGameState(parsed.gameState);
+                        firstClickRef.current = parsed.firstClick;
+                        if (parsed.gameState === 'playing' && !parsed.firstClick) {
+                            timerIntervalRef.current = setInterval(() => setTimer(t => t + 1), 1000);
+                        }
+                    } catch (e) {
+                        triggerNewGame();
+                    }
+                } else {
+                    triggerNewGame();
+                }
+                return () => clearInterval(timerIntervalRef.current);
+            }, []);
+
+            // --- PERSISTENCE: SAVE STATE ---
+            useEffect(() => {
+                if (grid.length > 0) {
+                    const state = { grid, difficulty, timer, flags, gameState, firstClick: firstClickRef.current };
+                    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+                }
+            }, [grid, timer, gameState, difficulty]);
+
+            const triggerHaptic = (type) => {
+                if (window.navigator.vibrate) {
+                    const p = { reveal: 10, flag: [20, 40], win: [50, 100], lost: 400 };
+                    window.navigator.vibrate(p[type] || 0);
+                }
+            };
+
+            const initGrid = (r, c) => Array.from({ length: r }, () => Array.from({ length: c }, () => ({ 
                 isMine: false, isRevealed: false, isFlagged: false, neighborCount: 0 
             })));
 
             const triggerNewGame = () => {
+                clearInterval(timerIntervalRef.current);
                 firstClickRef.current = true;
                 setTimer(0);
                 setFlags(0);
                 setGameState('playing');
                 setShowResetDialog(false);
                 setGrid(initGrid(difficulty.rows, difficulty.cols));
-                if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
             };
 
-            useEffect(() => { triggerNewGame(); }, [difficulty]);
-
-            const triggerHaptic = (type) => {
-                if (window.navigator.vibrate) {
-                    const patterns = { reveal: 10, flag: [15, 30], win: [50, 100, 50], lost: 500 };
-                    window.navigator.vibrate(patterns[type] || 0);
+            // --- TOUCH LOGIC ---
+            const handleTouchStart = (e) => {
+                if (e.touches.length >= 2) {
+                    isPinching.current = true;
+                    clearTimeout(longPressTimer.current);
+                    initialPinchDist.current = Math.hypot(e.touches[0].pageX - e.touches[1].pageX, e.touches[0].pageY - e.touches[1].pageY);
+                    initialZoom.current = zoom;
+                    return;
+                }
+                if (e.touches.length === 1 && gameState === 'playing') {
+                    isPinching.current = false;
+                    const rect = canvasRef.current.getBoundingClientRect();
+                    const touch = e.touches[0];
+                    const r = Math.floor((touch.clientY - rect.top) / zoom);
+                    const c = Math.floor((touch.clientX - rect.left) / zoom);
+                    longPressTimer.current = setTimeout(() => {
+                        if (!isPinching.current) toggleFlag(r, c);
+                        longPressTimer.current = null;
+                    }, 500);
                 }
             };
 
+            const handleTouchMove = (e) => {
+                if (e.touches.length >= 2 && initialPinchDist.current) {
+                    e.preventDefault();
+                    const dist = Math.hypot(e.touches[0].pageX - e.touches[1].pageX, e.touches[0].pageY - e.touches[1].pageY);
+                    const scale = dist / initialPinchDist.current;
+                    setZoom(Math.min(100, Math.max(16, initialZoom.current * scale)));
+                } else {
+                    clearTimeout(longPressTimer.current);
+                }
+            };
+
+            const handleTouchEnd = () => {
+                clearTimeout(longPressTimer.current);
+                initialPinchDist.current = null;
+                if (isPinching.current) setTimeout(() => { isPinching.current = false; }, 150);
+            };
+
+            const toggleFlag = (r, c) => {
+                if (gameState !== 'playing' || !grid[r]?.[c] || grid[r][c].isRevealed) return;
+                triggerHaptic('flag');
+                const next = JSON.parse(JSON.stringify(grid));
+                next[r][c].isFlagged = !next[r][c].isFlagged;
+                setFlags(next.flat().filter(cell => cell.isFlagged).length);
+                setGrid(next);
+            };
+
+            const handleReveal = (r, c) => {
+                if (isPinching.current || gameState !== 'playing' || !grid[r]?.[c] || grid[r][c].isRevealed || grid[r][c].isFlagged) return;
+                triggerHaptic('reveal');
+                let nextGrid = JSON.parse(JSON.stringify(grid));
+                if (firstClickRef.current) {
+                    let mines = 0;
+                    while (mines < difficulty.mines) {
+                        let rr = Math.floor(Math.random() * difficulty.rows), cc = Math.floor(Math.random() * difficulty.cols);
+                        if (!nextGrid[rr][cc].isMine && (Math.abs(rr - r) > 1 || Math.abs(cc - c) > 1)) {
+                            nextGrid[rr][cc].isMine = true;
+                            mines++;
+                        }
+                    }
+                    nextGrid.forEach((row, ri) => row.forEach((cell, ci) => {
+                        if (cell.isMine) return;
+                        let n = 0;
+                        for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) if (nextGrid[ri+i]?.[ci+j]?.isMine) n++;
+                        cell.neighborCount = n;
+                    }));
+                    firstClickRef.current = false;
+                    timerIntervalRef.current = setInterval(() => setTimer(t => t + 1), 1000);
+                }
+                const stack = [[r, c]];
+                while (stack.length > 0) {
+                    const [currR, currC] = stack.pop();
+                    if (nextGrid[currR][currC].isRevealed || nextGrid[currR][currC].isFlagged) continue;
+                    nextGrid[currR][currC].isRevealed = true;
+                    if (nextGrid[currR][currC].isMine) { endGame('lost', nextGrid); return; }
+                    if (nextGrid[currR][currC].neighborCount === 0) {
+                        for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) if (nextGrid[currR+i]?.[currC+j]) stack.push([currR+i, currC+j]);
+                    }
+                }
+                setGrid(nextGrid);
+                if (nextGrid.flat().filter(c => !c.isMine).every(c => c.isRevealed)) endGame('won', nextGrid);
+            };
+
+            const endGame = (status, finalGrid) => {
+                setGameState(status);
+                clearInterval(timerIntervalRef.current);
+                triggerHaptic(status);
+                if (status === 'lost') finalGrid.forEach(row => row.forEach(c => { if (c.isMine) c.isRevealed = true; }));
+                setGrid(finalGrid);
+                setTimeout(() => setShowResetDialog(true), 1200);
+            };
+
+            // --- CANVAS DRAW ---
+            useEffect(() => {
+                if (activeTab !== 'game' || grid.length === 0) return;
+                const canvas = canvasRef.current;
+                const ctx = canvas.getContext('2d');
+                const dpr = window.devicePixelRatio || 1;
+                canvas.width = difficulty.cols * zoom * dpr;
+                canvas.height = difficulty.rows * zoom * dpr;
+                canvas.style.width = `${difficulty.cols * zoom}px`;
+                canvas.style.height = `${difficulty.rows * zoom}px`;
+                ctx.scale(dpr, dpr);
+
+                grid.forEach((row, r) => row.forEach((cell, c) => {
+                    const x = c * zoom, y = r * zoom;
+                    const shadow = zoom * 0.12;
+                    if (cell.isRevealed) {
+                        ctx.fillStyle = cell.isMine ? '#ef4444' : '#d1d5db';
+                        ctx.fillRect(x, y, zoom, zoom);
+                        ctx.strokeStyle = '#9ca3af'; ctx.lineWidth = 1;
+                        ctx.strokeRect(x, y, zoom, zoom);
+                        if (cell.isMine) {
+                            ctx.font = `${zoom * 0.6}px Arial`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+                            ctx.fillText('💣', x + zoom/2, y + zoom/2);
+                        } else if (cell.neighborCount > 0) {
+                            const colors = ['', '#3b82f6', '#10b981', '#ef4444', '#6366f1', '#b91c1c', '#0d9488', '#000000'];
+                            ctx.fillStyle = colors[cell.neighborCount]; ctx.font = `bold ${zoom * 0.5}px sans-serif`;
+                            ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(cell.neighborCount, x + zoom/2, y + zoom/2);
+                        }
+                    } else {
+                        ctx.fillStyle = '#111827'; ctx.fillRect(x, y, zoom, zoom);
+                        ctx.beginPath();
+                        ctx.moveTo(x, y+zoom); ctx.lineTo(x, y); ctx.lineTo(x+zoom, y);
+                        ctx.lineTo(x+zoom-shadow, y+shadow); ctx.lineTo(x+shadow, y+shadow); ctx.lineTo(x+shadow, y+zoom-shadow);
+                        ctx.fillStyle = '#6b7280'; ctx.fill();
+                        ctx.fillStyle = '#374151'; ctx.fillRect(x+shadow, y+shadow, zoom-(shadow*2), zoom-(shadow*2));
+                        if (cell.isFlagged) {
+                            ctx.font = `${zoom * 0.6}px Arial`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+                            ctx.fillText('🚩', x + zoom/2, y + zoom/2);
+                        }
+                    }
+                }));
+            }, [grid, zoom, difficulty, activeTab]);
+
+            return (
+                <div className="min-h-screen bg-black text-white p-4 font-sans select-none overflow-x-hidden">
+                    <div className="max-w-md mx-auto flex items-center justify-between mb-4 bg-gray-900 p-3 rounded-2xl border border-white/5 shadow-xl">
+                        <div className="flex items-center gap-3">
+                            <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-600 to-blue-800 flex items-center justify-center font-black border-2 border-white/20">{userProfile.level}</div>
+                            <div className="max-w-[100px]">
+                                <h4 className="text-[10px] font-black uppercase text-gray-400">Identity</h4>
+                                <p className="text-sm font-bold truncate tracking-tight">{userProfile.name}</p>
+                            </div>
+                        </div>
+                        <div className="flex gap-2">
+                            <div className="bg-black/40 px-3 py-1 rounded-lg border border-white/5 text-center">
+                                <p className="text-[8px] text-gray-500 font-black uppercase">Mines</p>
+                                <p className="font-mono text-red-500 font-bold">{Math.max(0, difficulty.mines - flags)}</p>
+                            </div>
+                            <div className="bg-black/40 px-3 py-1 rounded-lg border border-white/5 text-center">
+                                <p className="text-[8px] text-gray-500 font-black uppercase">Time</p>
+                                <p className="font-mono text-yellow-500 font-bold">{timer}</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="max-w-md mx-auto grid grid-cols-3 bg-gray-900 p-1 rounded-xl mb-6 border border-white/5">
+                        {['game', 'leaderboard', 'settings'].map(t => (
+                            <button key={t} onClick={() => setActiveTab(t)} className={`py-2 rounded-lg text-[10px] font-black uppercase transition-all ${activeTab === t ? 'bg-blue-600 text-white shadow-lg' : 'text-gray-500'}`}>{t}</button>
+                        ))}
+                    </div>
+
+                    {activeTab === 'game' && (
+                        <div className="flex flex-col items-center">
+                            <div className="w-full max-w-md flex items-center gap-4 bg-gray-900/50 px-4 py-2 rounded-xl border border-white/5 mb-4">
+                                <span className="text-[9px] font-black uppercase text-gray-500">View</span>
+                                <input type="range" min="16" max="100" value={zoom} onChange={(e) => setZoom(parseInt(e.target.value))} className="flex-1 accent-blue-600" />
+                            </div>
+                            <div className="w-full relative border-4 border-gray-800 rounded-2xl overflow-auto bg-gray-950 shadow-2xl scrollbar-hide" style={{ maxHeight: '55vh' }}>
+                                <canvas ref={canvasRef} className="cursor-crosshair touch-none" onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd} onClick={(e) => {
+                                    const rect = canvasRef.current.getBoundingClientRect();
+                                    const r = Math.floor((e.clientY - rect.top) / zoom), c = Math.floor((e.clientX - rect.left) / zoom);
+                                    if (primaryMode === 'flag') toggleFlag(r, c); else handleReveal(r, c);
+                                }} />
+                            </div>
+                            <p className="mt-4 text-[9px] text-gray-500 uppercase font-black tracking-widest">Hold to Flag • Pinch to Zoom</p>
+                            <div className="flex gap-6 mt-6">
+                                <button onClick={() => setPrimaryMode('reveal')} className={`w-16 h-16 rounded-2xl flex flex-col items-center justify-center transition-all ${primaryMode === 'reveal' ? 'bg-blue-600 scale-110 shadow-lg' : 'bg-gray-900 opacity-40'}`}><span className="text-2xl">🔍</span></button>
+                                <button onClick={() => setPrimaryMode('flag')} className={`w-16 h-16 rounded-2xl flex flex-col items-center justify-center transition-all ${primaryMode === 'flag' ? 'bg-red-600 scale-110 shadow-lg' : 'bg-gray-900 opacity-40'}`}><span className="text-2xl">🚩</span></button>
+                            </div>
+                        </div>
+                    )}
+
+                    {activeTab === 'settings' && (
+                        <div className="w-full max-w-md mx-auto space-y-4">
+                            <div className="bg-gray-900 rounded-3xl p-6 border border-white/5">
+                                <h3 className="text-xs font-black text-gray-400 uppercase mb-4 tracking-tighter">Operational Difficulty</h3>
+                                <div className="grid grid-cols-2 gap-2">
+                                    {[{ label: 'Amateur', rows: 15, cols: 15, mines: 35 }, { label: 'Pro', rows: 20, cols: 20, mines: 80 }, { label: 'Elite', rows: 25, cols: 25, mines: 130 }, { label: 'God', rows: 30, cols: 30, mines: 200 }].map(d => (
+                                        <button key={d.label} onClick={() => setDifficulty(d)} className={`p-4 rounded-xl border-2 text-left transition-all ${difficulty.label === d.label ? 'border-blue-600 bg-blue-600/10' : 'border-gray-800'}`}>
+                                            <p className="font-black text-xs uppercase">{d.label}</p>
+                                            <p className="text-[9px] text-gray-500 font-bold">{d.mines} Mines</p>
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+                            <button onClick={() => { localStorage.removeItem(STORAGE_KEY); triggerNewGame(); }} className="w-full py-4 text-xs font-black text-red-500 uppercase bg-red-500/10 rounded-xl border border-red-500/20">Clear Local Session</button>
+                        </div>
+                    )}
+
+                    {showResetDialog && (
+                        <div className="fixed inset-0 bg-black/95 backdrop-blur-md z-[200] flex items-center justify-center p-6">
+                            <div className="bg-gray-900 border border-white/10 p-10 rounded-[3rem] text-center max-w-sm w-full shadow-2xl">
+                                <h2 className={`text-6xl font-black mb-2 italic ${gameState === 'won' ? 'text-green-400' : 'text-red-600'}`}>{gameState === 'won' ? 'WON' : 'LOST'}</h2>
+                                <p className="text-5xl font-mono font-black mb-8">{timer}s</p>
+                                <button onClick={triggerNewGame} className="w-full bg-white text-black py-4 rounded-2xl font-black text-lg">REDEPLOY</button>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        const
             const handleReveal = (r, c) => {
                 if (gameState !== 'playing' || !grid[r]?.[c] || grid[r][c].isRevealed || grid[r][c].isFlagged) return;
                 triggerHaptic('reveal');
